@@ -743,9 +743,13 @@ async def live_connect(
         except Exception:
             pass
 
+        client_pv = f"v{match['protocol_version']}" if match else "unknown (no broadcast seen)"
+        server_pv = f"v{_OUR_PROTOCOL_VERSION}" if _OUR_PROTOCOL_VERSION is not None else "unknown"
+        proto_hint = f" Protocol: server bindings {server_pv}, target client {client_pv}."
+
         return (
             f"Reached {address}:{port} but the Tracy handshake did not complete "
-            f"within {deadline_s:.1f}s.{status_hint}{failure_hint}{hint} Common causes: (1) the "
+            f"within {deadline_s:.1f}s.{status_hint}{failure_hint}{hint}{proto_hint} Common causes: (1) the "
             f"Tracy client version embedded in the target program differs from "
             f"these server bindings; (2) the target was built with "
             f"TRACY_ON_DEMAND and is awaiting a profiler request; (3) another "
