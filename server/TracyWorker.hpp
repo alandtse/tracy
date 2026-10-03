@@ -459,6 +459,17 @@ private:
     };
 
 public:
+    enum class CloseReason : uint8_t
+    {
+        None,
+        LocalShutdown,
+        MemoryLimit,
+        SocketClosed,
+        StreamFailure,
+        TargetTerminate
+    };
+    static constexpr uint8_t NoQueueType = 255;
+
     enum class Failure
     {
         None,
@@ -718,6 +729,9 @@ public:
     void Write( FileWrite& f, bool fiDict );
     int GetTraceVersion() const { return m_traceVersion; }
     uint8_t GetHandshakeStatus() const { return m_handshake.load( std::memory_order_relaxed ); }
+    CloseReason GetCloseReason() const { return m_closeReason.load( std::memory_order_relaxed ); }
+    int64_t GetMemoryGrowth() const { return m_memGrowth.load( std::memory_order_relaxed ); }
+    uint8_t GetLastQueueType() const { return m_lastQueueType.load( std::memory_order_relaxed ); }
     int64_t GetSamplingPeriod() const { return m_samplingPeriod; }
     bool AreSamplesInconsistent() const { return m_inconsistentSamples; }
     void NotifyExcessiveZoneDepth( int64_t time )
@@ -777,6 +791,7 @@ public:
 
 private:
     void Network();
+    void SetCloseReason( CloseReason reason );
     void Exec();
     void Query( ServerQuery type, uint64_t data, uint32_t extra = 0 );
     void QueryTerminate();
@@ -1172,7 +1187,9 @@ private:
 
     int m_traceVersion;
     std::atomic<uint8_t> m_handshake { 0 };
+    std::atomic<CloseReason> m_closeReason { CloseReason::None };
     std::atomic<int64_t> m_memGrowth { 0 };
+    std::atomic<uint8_t> m_lastQueueType { NoQueueType };
 
     static LoadProgress s_loadProgress;
     int64_t m_loadTime;

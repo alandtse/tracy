@@ -1106,6 +1106,15 @@ PYBIND11_MODULE( TracyServerBindings, m )
         // Raw HandshakeStatus byte (TracyProtocol.hpp): 0=none, 1=Welcome,
         // 2=ProtocolMismatch, 3=NotAvailable, 4=Dropped.
         .def( "get_handshake_status", &Worker::GetHandshakeStatus )
+        // Worker::CloseReason as an int; 0 means still open. The non-zero
+        // values are listed in the module's close_reasons dict.
+        .def( "get_close_reason", []( const Worker& w ) -> int { return (int)w.GetCloseReason(); } )
+        // QueueType of the last item processed, or Worker::NoQueueType (255).
+        .def( "get_last_queue_type", &Worker::GetLastQueueType )
+        // Live memory cap in bytes (<=0 unlimited) and this worker's tracked
+        // allocation growth since it connected.
+        .def( "get_memory_limit", &Worker::GetMemoryLimit )
+        .def( "get_memory_growth", &Worker::GetMemoryGrowth )
         // Raw Failure byte (Worker::Failure, TracyWorker.hpp): 0=None,
         // ZoneStack, ZoneDoubleEnd, ZoneText, ZoneValue, ZoneColor, ZoneName,
         // MemFree, MemAllocTwice, FrameEnd, FrameImageIndex, FrameImageTwice,
@@ -1134,6 +1143,17 @@ PYBIND11_MODULE( TracyServerBindings, m )
     // -------------------------------------------------------------------------
     // FileRead
     // -------------------------------------------------------------------------
+    // Process-wide bytes currently tracked by the server allocator (all
+    // loaded captures and live workers combined).
+    m.attr( "no_queue_type" ) = (int)Worker::NoQueueType;
+    m.attr( "close_reasons" ) = py::dict(
+        "local_shutdown"_a = (int)Worker::CloseReason::LocalShutdown,
+        "memory_limit"_a = (int)Worker::CloseReason::MemoryLimit,
+        "socket_closed"_a = (int)Worker::CloseReason::SocketClosed,
+        "stream_failure"_a = (int)Worker::CloseReason::StreamFailure,
+        "target_terminate"_a = (int)Worker::CloseReason::TargetTerminate );
+    m.def( "tracked_memory", []() -> int64_t { return memUsage.load( std::memory_order_relaxed ); } );
+
     m.def( "open_file", []( const char* path ) -> std::shared_ptr<FileRead> {
         auto f = FileRead::Open( path );
         if( !f ) throw std::runtime_error( "Could not open file" );

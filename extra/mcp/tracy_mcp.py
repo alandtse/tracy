@@ -399,6 +399,11 @@ def _evict_idle() -> list[str]:
             continue
         if inst.disconnected_since is None:
             inst.disconnected_since = now
+            print(
+                f"[live] instance '{name}' disconnected: {_disconnect_reason(inst) or 'unknown'}",
+                file=sys.stderr,
+                flush=True,
+            )
             continue
         if now - inst.disconnected_since >= _DISCONNECTED_TTL_S:
             del instances[name]
@@ -491,6 +496,43 @@ async def list_captures() -> list[str]:
     return sorted(glob.glob(os.path.join(captures_dir, "*.tracy")))
 
 
+# Keyed by the names in tracy_server.close_reasons (Worker::CloseReason).
+_CLOSE_REASON_TEXT = {
+    "local_shutdown": "local shutdown",
+    "memory_limit": "live memory limit exceeded",
+    "socket_closed": "socket closed/reset by the target (client-side close)",
+    "stream_failure": "event-stream failure (see Failure data)",
+    "target_terminate": "target sent Terminate (clean profiler shutdown)",
+}
+
+
+def _disconnect_reason(inst) -> str | None:
+    """Why a live instance's stream ended, or None while connected / for files."""
+    if inst.path is not None or not inst.worker:
+        return None
+    try:
+        if inst.worker.is_connected():
+            return None
+        code = inst.worker.get_close_reason()
+        if not code:
+            return None
+        name = next((n for n, c in tracy_server.close_reasons.items() if c == code), None)
+        text = _CLOSE_REASON_TEXT.get(name, f"close reason {code}")
+        last_type = inst.worker.get_last_queue_type()
+        if last_type != tracy_server.no_queue_type:
+            text += f"; last queue item type {last_type}"
+        if name == "memory_limit":
+            mb = 1024 * 1024
+            text += (
+                f"; cap {inst.worker.get_memory_limit() // mb} MB, this connection "
+                f"grew {inst.worker.get_memory_growth() // mb} MB "
+                f"(process tracks {tracy_server.tracked_memory() // mb} MB in total)"
+            )
+        return text
+    except Exception:
+        return None
+
+
 @mcp_server.tool()
 async def list_instances() -> list[dict]:
     """List all loaded Tracy instances and captures with metadata.
@@ -519,6 +561,7 @@ async def list_instances() -> list[dict]:
             "mtime": inst.mtime,
             "live": inst.path is None,
             "connected": inst.worker.is_connected() if inst.path is None and inst.worker else None,
+            "disconnect_reason": _disconnect_reason(inst),
             "background_done": inst.worker.is_background_done() if inst.worker else None,
             "idle_seconds": now - inst.last_used,
         }
