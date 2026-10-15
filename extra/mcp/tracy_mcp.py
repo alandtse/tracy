@@ -6,6 +6,7 @@ import atexit
 import builtins
 import concurrent.futures
 import faulthandler
+import gc
 import glob
 import io
 import os
@@ -532,6 +533,7 @@ def _make_room(needed_mb: int, exclude: str | None = None) -> tuple[list[str], s
         if name is None:
             return evicted, why
         evicted.append(name)
+        gc.collect()
 
 
 def _loaded_summary() -> str:
@@ -559,6 +561,8 @@ async def _sweep_loop() -> None:
         await asyncio.sleep(_SWEEP_INTERVAL_S)
         try:
             evicted = _evict_idle()
+            if evicted:
+                gc.collect()
             if _MEMORY_BUDGET_MB is not None and _tracked_mb() > _MEMORY_BUDGET_MB:
                 evicted = (evicted or []) + _make_room(0)[0]
         except Exception:
@@ -1105,6 +1109,8 @@ async def unload_capture(instance_id: str) -> str:
     if instance_id in instances:
         inst = instances.pop(instance_id)
         _shutdown_worker(inst.worker)
+        del inst
+        gc.collect()
         return f"Instance '{instance_id}' unloaded."
     return f"Instance '{instance_id}' not found."
 
