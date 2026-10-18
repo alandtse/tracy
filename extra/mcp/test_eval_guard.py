@@ -33,6 +33,20 @@ def add(name="a"):
     return inst
 
 
+def test_scratch_persists_across_evals():
+    inst = add()
+    tracy_mcp._execute_eval_sync("scratch['n'] = 41", inst.worker, inst.scratch)
+    out = tracy_mcp._execute_eval_sync("print(scratch['n'] + 1)", inst.worker, inst.scratch)
+    assert out.strip() == "42"
+
+
+def test_scratch_is_per_instance():
+    a, b = add("a"), add("b")
+    tracy_mcp._execute_eval_sync("scratch['n'] = 1", a.worker, a.scratch)
+    out = tracy_mcp._execute_eval_sync("print(scratch)", b.worker, b.scratch)
+    assert out.strip() == "{}"
+
+
 def test_busy_instance_is_not_evictable():
     inst = add()
     assert inst.is_evictable()

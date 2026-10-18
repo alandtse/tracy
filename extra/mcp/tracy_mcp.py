@@ -429,6 +429,8 @@ class TracyInstance:
         # Tracked memory this instance added when loaded; live instances
         # report their own growth instead.
         self.memory_mb = 0
+        # Survives across eval calls on this instance; dropped with it.
+        self.scratch: dict = {}
         self._eval_lock = threading.Lock()
         self.active_evals = 0
 
@@ -1147,6 +1149,9 @@ async def tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> o
     `tracy://eval-guide` (ctx object model, units, source-location ID joins)
     resources. Time values returned by Worker methods are nanoseconds.
 
+    `scratch` is a dict that persists across eval calls on the same instance
+    (and is dropped when it is unloaded), for carrying results between calls.
+
     If async_mode=True, returns a task_id immediately; poll via the `task` tool.
     """
     if instance_id not in instances:
@@ -1160,7 +1165,7 @@ async def tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> o
     if not async_mode:
         instance.begin_eval()
         try:
-            return await _execute_eval(code, instance.worker)
+            return await _execute_eval(code, instance.worker, instance.scratch)
         finally:
             instance.end_eval()
 
@@ -1179,7 +1184,7 @@ def _run_task_sync(task: Task, instance: TracyInstance) -> None:
     """Run a background eval task in the thread pool."""
     task.status = "running"
     try:
-        task.result = _execute_eval_sync(task.code, instance.worker)
+        task.result = _execute_eval_sync(task.code, instance.worker, instance.scratch)
         task.status = "completed"
     except Exception as e:
         task.error = str(e)
@@ -1189,11 +1194,12 @@ def _run_task_sync(task: Task, instance: TracyInstance) -> None:
         instance.end_eval()
 
 
-def _execute_eval_sync(code: str, ctx: object) -> str:
+def _execute_eval_sync(code: str, ctx: object, scratch: dict | None = None) -> str:
     """Execute *code* with `ctx` bound to the Tracy worker. Captures stdout."""
     global_vars = {
         "__builtins__": builtins,
         "ctx": ctx,
+        "scratch": scratch if scratch is not None else {},
         "tracy": tracy_server,
         "instances": {name: inst.worker for name, inst in instances.items()},
     }
@@ -1210,10 +1216,10 @@ def _execute_eval_sync(code: str, ctx: object) -> str:
     return str(result)
 
 
-async def _execute_eval(code: str, ctx: object) -> str:
+async def _execute_eval(code: str, ctx: object, scratch: dict | None = None) -> str:
     """Async wrapper: runs `_execute_eval_sync` in the thread-pool executor."""
     return await asyncio.get_running_loop().run_in_executor(
-        executor, _execute_eval_sync, code, ctx
+        executor, _execute_eval_sync, code, ctx, scratch
     )
 
 

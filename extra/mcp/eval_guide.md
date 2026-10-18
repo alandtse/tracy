@@ -108,7 +108,9 @@ frees it just because your conversation ends.
   least-recently-used evictable instances, then refuses with a message
   listing what is loaded. `TRACY_MCP_LOAD_EXPANSION` (default 15) tunes the
   size estimate; `list_instances` reports `memory_mb` per instance.
-- `unload_capture` refuses while an eval on the instance is still running.
+- `eval` also binds `scratch`, a dict that persists across eval calls on the same
+  instance, so intermediate results don't have to be pasted into the next call.
+  `unload_capture` refuses while an eval on the instance is still running.
 - `list_instances` reports `idle_seconds`, `connected`, and `background_done`
   per instance; use it to spot stale ones before starting a new session,
   especially if you're about to load several captures for comparison.
