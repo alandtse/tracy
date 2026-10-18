@@ -6,6 +6,7 @@ import atexit
 import builtins
 import concurrent.futures
 import faulthandler
+import gc
 import glob
 import io
 import os
@@ -14,6 +15,7 @@ import re
 import socket
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -322,6 +324,85 @@ _DISCONNECTED_TTL_S = float(os.environ.get("TRACY_MCP_DISCONNECTED_TTL_S", "1800
 _FILE_IDLE_TTL_S = float(os.environ.get("TRACY_MCP_FILE_IDLE_TTL_S", "1800"))
 _SWEEP_INTERVAL_S = float(os.environ.get("TRACY_MCP_SWEEP_INTERVAL_S", "300"))
 _DEFAULT_LIVE_MEMORY_LIMIT_MB = int(os.environ.get("TRACY_MCP_LIVE_MEMORY_LIMIT_MB", "8192"))
+# Loaded traces take roughly this many times their on-disk size in RAM.
+_LOAD_EXPANSION = float(os.environ.get("TRACY_MCP_LOAD_EXPANSION", "15"))
+# Physical RAM left alone for the OS and the games being profiled.
+_RAM_RESERVE_MB = int(os.environ.get("TRACY_MCP_RAM_RESERVE_MB", "8192"))
+_MIN_LIVE_HEADROOM_MB = 1024
+_MB = 1024 * 1024
+
+
+def _physical_memory_mb() -> tuple[int, int] | None:
+    """(total, available) physical RAM in MB, or None if it can't be read."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = MemStatus()
+            st.dwLength = ctypes.sizeof(st)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return None
+            return st.ullTotalPhys // _MB, st.ullAvailPhys // _MB
+        page = os.sysconf("SC_PAGE_SIZE")
+        return os.sysconf("SC_PHYS_PAGES") * page // _MB, os.sysconf("SC_AVPHYS_PAGES") * page // _MB
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _default_memory_budget_mb() -> int | None:
+    env = os.environ.get("TRACY_MCP_MEMORY_BUDGET_MB")
+    if env is not None:
+        return int(env) if int(env) > 0 else None
+    phys = _physical_memory_mb()
+    return phys[0] // 2 if phys else None
+
+
+# Cap on the process-wide tracked trace memory (loaded captures and live
+# connections together). None disables the budget.
+_MEMORY_BUDGET_MB = _default_memory_budget_mb()
+
+
+def _tracked_mb() -> int:
+    return tracy_server.tracked_memory() // _MB if tracy_server else 0
+
+
+def _available_mb() -> int | None:
+    phys = _physical_memory_mb()
+    return phys[1] if phys else None
+
+
+def _budget_shortfall(
+    tracked_mb: int,
+    needed_mb: int,
+    budget_mb: int | None,
+    available_mb: int | None,
+    reserve_mb: int,
+) -> str | None:
+    """Why `needed_mb` more tracked memory doesn't fit, or None if it does."""
+    if budget_mb is not None and tracked_mb + needed_mb > budget_mb:
+        return (
+            f"{tracked_mb} MB is already tracked and this needs about {needed_mb} MB, "
+            f"over the {budget_mb} MB memory budget"
+        )
+    if available_mb is not None and needed_mb > available_mb - reserve_mb:
+        return (
+            f"this needs about {needed_mb} MB but only {available_mb} MB of RAM is free "
+            f"({reserve_mb} MB is kept in reserve)"
+        )
+    return None
+
+
+def _estimate_load_mb(file_bytes: int) -> int:
+    return int(file_bytes * _LOAD_EXPANSION) // _MB
 
 
 class Task:
@@ -345,6 +426,21 @@ class TracyInstance:
         # Wall-clock time the instance was first observed disconnected (live
         # instances only). None while connected or for file-loaded captures.
         self.disconnected_since: float | None = None
+        # Tracked memory this instance added when loaded; live instances
+        # report their own growth instead.
+        self.memory_mb = 0
+        # Survives across eval calls on this instance; dropped with it.
+        self.scratch: dict = {}
+        self._eval_lock = threading.Lock()
+        self.active_evals = 0
+
+    def begin_eval(self) -> None:
+        with self._eval_lock:
+            self.active_evals += 1
+
+    def end_eval(self) -> None:
+        with self._eval_lock:
+            self.active_evals -= 1
 
     def touch(self) -> None:
         self.last_used = time.time()
@@ -354,8 +450,11 @@ class TracyInstance:
 
         A live instance still connected is actively recording — never evict it
         automatically. Everything else (file captures, disconnected live
-        instances) is fair game for the LRU cap.
+        instances) is fair game for the LRU cap. An instance with an eval
+        in flight is never evictable.
         """
+        if self.active_evals > 0:
+            return False
         if self.worker is not None and self.path is None:
             try:
                 return not self.worker.is_connected()
@@ -382,6 +481,8 @@ def _evict_idle() -> list[str]:
     now = time.time()
     evicted = []
     for name, inst in list(instances.items()):
+        if inst.active_evals > 0:
+            continue
         if inst.path is not None:
             if now - inst.last_used >= _FILE_IDLE_TTL_S:
                 del instances[name]
@@ -399,6 +500,11 @@ def _evict_idle() -> list[str]:
             continue
         if inst.disconnected_since is None:
             inst.disconnected_since = now
+            print(
+                f"[live] instance '{name}' disconnected: {_disconnect_reason(inst) or 'unknown'}",
+                file=sys.stderr,
+                flush=True,
+            )
             continue
         if now - inst.disconnected_since >= _DISCONNECTED_TTL_S:
             del instances[name]
@@ -412,6 +518,11 @@ def _evict_for_capacity(exclude: str | None = None) -> str | None:
     instance to make room for a new one. Returns the evicted name, if any."""
     if len(instances) < _MAX_INSTANCES:
         return None
+    return _drop_lru(exclude)
+
+
+def _drop_lru(exclude: str | None = None) -> str | None:
+    """Unload the least-recently-used evictable instance, returning its name."""
     candidates = [
         inst for name, inst in instances.items()
         if name != exclude and inst.is_evictable()
@@ -422,6 +533,39 @@ def _evict_for_capacity(exclude: str | None = None) -> str | None:
     del instances[victim.name]
     _shutdown_worker(victim.worker)
     return victim.name
+
+
+def _make_room(needed_mb: int, exclude: str | None = None) -> tuple[list[str], str | None]:
+    """Evict idle instances until `needed_mb` fits the budget and free RAM.
+
+    Returns (evicted names, shortfall); the shortfall is None on success.
+    """
+    if _MEMORY_BUDGET_MB is not None and needed_mb > _MEMORY_BUDGET_MB:
+        return [], _budget_shortfall(0, needed_mb, _MEMORY_BUDGET_MB, None, 0)
+    evicted: list[str] = []
+    while True:
+        why = _budget_shortfall(_tracked_mb(), needed_mb, _MEMORY_BUDGET_MB, _available_mb(), _RAM_RESERVE_MB)
+        if why is None:
+            return evicted, None
+        name = _drop_lru(exclude)
+        if name is None:
+            return evicted, why
+        evicted.append(name)
+        gc.collect()
+
+
+def _loaded_summary() -> str:
+    parts = [f"'{n}' ({_instance_memory_mb(i)} MB)" for n, i in instances.items()]
+    return ", ".join(parts) if parts else "nothing"
+
+
+def _instance_memory_mb(inst: "TracyInstance") -> int:
+    if inst.path is None and inst.worker is not None:
+        try:
+            return inst.worker.get_memory_growth() // _MB
+        except Exception:
+            return 0
+    return inst.memory_mb
 
 
 async def _sweep_loop() -> None:
@@ -435,11 +579,16 @@ async def _sweep_loop() -> None:
         await asyncio.sleep(_SWEEP_INTERVAL_S)
         try:
             evicted = _evict_idle()
+            if evicted:
+                gc.collect()
+            if _MEMORY_BUDGET_MB is not None and _tracked_mb() > _MEMORY_BUDGET_MB:
+                evicted = (evicted or []) + _make_room(0)[0]
         except Exception:
             evicted = None
         print(
             f"[heartbeat] uptime={int(time.time() - start)}s "
             f"instances={len(instances)} tasks={len(tasks)} "
+            f"tracked={_tracked_mb()}MB free_ram={_available_mb()}MB "
             f"evicted={evicted or 'none'}",
             file=sys.stderr,
             flush=True,
@@ -491,6 +640,43 @@ async def list_captures() -> list[str]:
     return sorted(glob.glob(os.path.join(captures_dir, "*.tracy")))
 
 
+# Keyed by the names in tracy_server.close_reasons (Worker::CloseReason).
+_CLOSE_REASON_TEXT = {
+    "local_shutdown": "local shutdown",
+    "memory_limit": "live memory limit exceeded",
+    "socket_closed": "socket closed/reset by the target (client-side close)",
+    "stream_failure": "event-stream failure (see Failure data)",
+    "target_terminate": "target sent Terminate (clean profiler shutdown)",
+}
+
+
+def _disconnect_reason(inst) -> str | None:
+    """Why a live instance's stream ended, or None while connected / for files."""
+    if inst.path is not None or not inst.worker:
+        return None
+    try:
+        if inst.worker.is_connected():
+            return None
+        code = inst.worker.get_close_reason()
+        if not code:
+            return None
+        name = next((n for n, c in tracy_server.close_reasons.items() if c == code), None)
+        text = _CLOSE_REASON_TEXT.get(name, f"close reason {code}")
+        last_type = inst.worker.get_last_queue_type()
+        if last_type != tracy_server.no_queue_type:
+            text += f"; last queue item type {last_type}"
+        if name == "memory_limit":
+            mb = 1024 * 1024
+            text += (
+                f"; cap {inst.worker.get_memory_limit() // mb} MB, this connection "
+                f"grew {inst.worker.get_memory_growth() // mb} MB "
+                f"(process tracks {tracy_server.tracked_memory() // mb} MB in total)"
+            )
+        return text
+    except Exception:
+        return None
+
+
 @mcp_server.tool()
 async def list_instances() -> list[dict]:
     """List all loaded Tracy instances and captures with metadata.
@@ -519,6 +705,8 @@ async def list_instances() -> list[dict]:
             "mtime": inst.mtime,
             "live": inst.path is None,
             "connected": inst.worker.is_connected() if inst.path is None and inst.worker else None,
+            "memory_mb": _instance_memory_mb(inst),
+            "disconnect_reason": _disconnect_reason(inst),
             "background_done": inst.worker.is_background_done() if inst.worker else None,
             "idle_seconds": now - inst.last_used,
         }
@@ -593,7 +781,23 @@ async def live_connect(
             )
 
     limit_mb = _DEFAULT_LIVE_MEMORY_LIMIT_MB if memory_limit_mb is None else memory_limit_mb
-    memory_limit = limit_mb * 1024 * 1024 if limit_mb > 0 else -1
+    budget_evicted: list[str] = []
+    if _MEMORY_BUDGET_MB is not None:
+        want_mb = limit_mb if limit_mb > 0 else _MEMORY_BUDGET_MB
+        budget_evicted, why = _make_room(want_mb, exclude=alias)
+        if why is not None:
+            headroom_mb = _MEMORY_BUDGET_MB - _tracked_mb()
+            avail = _available_mb()
+            if avail is not None:
+                headroom_mb = min(headroom_mb, avail - _RAM_RESERVE_MB)
+            if headroom_mb < _MIN_LIVE_HEADROOM_MB:
+                return (
+                    f"Not enough memory for a live capture: {why}. Currently loaded: "
+                    f"{_loaded_summary()}. Unload captures you no longer need or raise "
+                    f"TRACY_MCP_MEMORY_BUDGET_MB."
+                )
+            limit_mb = headroom_mb
+    memory_limit = limit_mb * _MB if limit_mb > 0 else -1
     print(f"[live_connect] connecting to {address}:{port} ...", file=sys.stderr, flush=True)
     try:
         w = tracy_server.Worker(address, port, memory_limit)
@@ -700,9 +904,13 @@ async def live_connect(
         except Exception:
             pass
 
+        client_pv = f"v{match['protocol_version']}" if match else "unknown (no broadcast seen)"
+        server_pv = f"v{_OUR_PROTOCOL_VERSION}" if _OUR_PROTOCOL_VERSION is not None else "unknown"
+        proto_hint = f" Protocol: server bindings {server_pv}, target client {client_pv}."
+
         return (
             f"Reached {address}:{port} but the Tracy handshake did not complete "
-            f"within {deadline_s:.1f}s.{status_hint}{failure_hint}{hint} Common causes: (1) the "
+            f"within {deadline_s:.1f}s.{status_hint}{failure_hint}{hint}{proto_hint} Common causes: (1) the "
             f"Tracy client version embedded in the target program differs from "
             f"these server bindings; (2) the target was built with "
             f"TRACY_ON_DEMAND and is awaiting a profiler request; (3) another "
@@ -721,6 +929,8 @@ async def live_connect(
     instances[name] = TracyInstance(name, w)
     note = f" (evicted idle instance '{evicted}' to stay under the {_MAX_INSTANCES}-instance cap)" if evicted else ""
     limit_note = f"{limit_mb}MB memory limit" if limit_mb > 0 else "no memory limit"
+    if budget_evicted:
+        note += f" (evicted {', '.join(budget_evicted)} to make memory room)"
     return (
         f"Connected to live instance as '{name}'{note} ({limit_note}). "
         f"Before your first eval, read resources tracy://prompt "
@@ -765,16 +975,29 @@ async def load_capture(path: str, alias: str | None = None) -> str:
                 inst.touch()
                 return f"Instance '{name}' is already loaded and up to date."
             _shutdown_worker(inst.worker)
+            del instances[name], inst
 
         evicted = _evict_for_capacity(exclude=name)
+        evicted_names = [evicted] if evicted else []
+        needed_mb = _estimate_load_mb(os.path.getsize(path))
+        freed, why = _make_room(needed_mb, exclude=name)
+        evicted_names += freed
+        if why is not None:
+            return (
+                f"Not loaded: {why}. Currently loaded: {_loaded_summary()}. "
+                f"Unload captures you no longer need (unload_capture) or raise "
+                f"TRACY_MCP_MEMORY_BUDGET_MB."
+            )
 
+        before_mb = _tracked_mb()
         f = tracy_server.open_file(path)
         w = tracy_server.create_worker_from_file(f)
         inst = TracyInstance(name, w)
         inst.path = path
         inst.mtime = mtime
+        inst.memory_mb = max(_tracked_mb() - before_mb, 0)
         instances[name] = inst
-        note = f" (evicted idle instance '{evicted}' to stay under the {_MAX_INSTANCES}-instance cap)" if evicted else ""
+        note = f" (evicted idle instance(s) {', '.join(evicted_names)} to make room)" if evicted_names else ""
         return (
             f"Loaded as '{name}'{note}. "
             f"Before your first eval, read resources tracy://prompt "
@@ -901,11 +1124,20 @@ async def unload_capture(instance_id: str) -> str:
     Automatic eviction exists as a backstop (see `list_instances`), not a
     substitute for unloading what you no longer need.
     """
-    if instance_id in instances:
-        inst = instances.pop(instance_id)
-        _shutdown_worker(inst.worker)
-        return f"Instance '{instance_id}' unloaded."
-    return f"Instance '{instance_id}' not found."
+    inst = instances.get(instance_id)
+    if inst is None:
+        return f"Instance '{instance_id}' not found."
+    if inst.active_evals > 0:
+        return (
+            f"Instance '{instance_id}' has {inst.active_evals} eval(s) still running, so it was "
+            f"not unloaded. Wait for them to finish (poll async evals with the `task` tool), "
+            f"then unload."
+        )
+    del instances[instance_id]
+    _shutdown_worker(inst.worker)
+    del inst
+    gc.collect()
+    return f"Instance '{instance_id}' unloaded."
 
 
 @mcp_server.tool(name="eval")
@@ -916,6 +1148,9 @@ async def tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> o
     On first use, read the `tracy://prompt` (analysis guidance) and
     `tracy://eval-guide` (ctx object model, units, source-location ID joins)
     resources. Time values returned by Worker methods are nanoseconds.
+
+    `scratch` is a dict that persists across eval calls on the same instance
+    (and is dropped when it is unloaded), for carrying results between calls.
 
     If async_mode=True, returns a task_id immediately; poll via the `task` tool.
     """
@@ -928,36 +1163,43 @@ async def tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> o
     instance.touch()
 
     if not async_mode:
-        return await _execute_eval(code, instance.worker)
+        instance.begin_eval()
+        try:
+            return await _execute_eval(code, instance.worker, instance.scratch)
+        finally:
+            instance.end_eval()
 
     # Async mode: spawn task and return immediately
     task_id = str(uuid.uuid4())
     task = Task(task_id, code)
     tasks[task_id] = task
+    instance.begin_eval()
     asyncio.get_running_loop().run_in_executor(
-        executor, _run_task_sync, task, instance.worker
+        executor, _run_task_sync, task, instance
     )
     return {"task_id": task_id, "status": "running"}
 
 
-def _run_task_sync(task: Task, worker: object) -> None:
+def _run_task_sync(task: Task, instance: TracyInstance) -> None:
     """Run a background eval task in the thread pool."""
     task.status = "running"
     try:
-        task.result = _execute_eval_sync(task.code, worker)
+        task.result = _execute_eval_sync(task.code, instance.worker, instance.scratch)
         task.status = "completed"
     except Exception as e:
         task.error = str(e)
         task.status = "failed"
     finally:
         task.end_time = time.time()
+        instance.end_eval()
 
 
-def _execute_eval_sync(code: str, ctx: object) -> str:
+def _execute_eval_sync(code: str, ctx: object, scratch: dict | None = None) -> str:
     """Execute *code* with `ctx` bound to the Tracy worker. Captures stdout."""
     global_vars = {
         "__builtins__": builtins,
         "ctx": ctx,
+        "scratch": scratch if scratch is not None else {},
         "tracy": tracy_server,
         "instances": {name: inst.worker for name, inst in instances.items()},
     }
@@ -974,10 +1216,10 @@ def _execute_eval_sync(code: str, ctx: object) -> str:
     return str(result)
 
 
-async def _execute_eval(code: str, ctx: object) -> str:
+async def _execute_eval(code: str, ctx: object, scratch: dict | None = None) -> str:
     """Async wrapper: runs `_execute_eval_sync` in the thread-pool executor."""
     return await asyncio.get_running_loop().run_in_executor(
-        executor, _execute_eval_sync, code, ctx
+        executor, _execute_eval_sync, code, ctx, scratch
     )
 
 

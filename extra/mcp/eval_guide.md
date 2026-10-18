@@ -95,10 +95,22 @@ frees it just because your conversation ends.
   capture. Don't rely on automatic eviction as your primary cleanup path —
   treat it as a backstop for forgotten sessions, not a substitute.
 - `live_connect` caps a live session at `TRACY_MCP_LIVE_MEMORY_LIMIT_MB`
-  (default 8192, override per-call or set 0 to disable) — a long-lived
-  session on a busy target otherwise grows unbounded and can OOM-kill the
-  whole server process. Hitting the cap disconnects that instance cleanly;
-  data collected so far stays queryable and `save_trace`-able.
+  (default 8192, override per-call) — a long-lived session on a busy target
+  otherwise grows unbounded and can OOM-kill the whole server process.
+  Hitting the cap disconnects that instance cleanly; data collected so far
+  stays queryable and `save_trace`-able. The cap is also clamped to the
+  memory budget below, so `memory_limit_mb=0` cannot exceed it.
+- A loaded `.tracy` file takes about 14x its on-disk size in RAM. The server
+  keeps all loaded captures and live sessions within
+  `TRACY_MCP_MEMORY_BUDGET_MB` (default: half of physical RAM; 0 disables)
+  and leaves `TRACY_MCP_RAM_RESERVE_MB` (default 8192) of RAM free. To fit
+  a new `load_capture` or `live_connect`, it first unloads the
+  least-recently-used evictable instances, then refuses with a message
+  listing what is loaded. `TRACY_MCP_LOAD_EXPANSION` (default 15) tunes the
+  size estimate; `list_instances` reports `memory_mb` per instance.
+- `eval` also binds `scratch`, a dict that persists across eval calls on the same
+  instance, so intermediate results don't have to be pasted into the next call.
+  `unload_capture` refuses while an eval on the instance is still running.
 - `list_instances` reports `idle_seconds`, `connected`, and `background_done`
   per instance; use it to spot stale ones before starting a new session,
   especially if you're about to load several captures for comparison.

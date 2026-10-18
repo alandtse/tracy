@@ -1106,6 +1106,18 @@ PYBIND11_MODULE( TracyServerBindings, m )
         // Raw HandshakeStatus byte (TracyProtocol.hpp): 0=none, 1=Welcome,
         // 2=ProtocolMismatch, 3=NotAvailable, 4=Dropped.
         .def( "get_handshake_status", &Worker::GetHandshakeStatus )
+        // Worker::CloseReason as an int; 0 means still open. The non-zero
+        // values are listed in the module's close_reasons dict.
+        .def( "get_close_reason", []( const Worker& w ) -> int { return (int)w.GetCloseReason(); } )
+        // QueueType of the last item processed, or Worker::NoQueueType (255).
+        .def( "get_last_queue_type", &Worker::GetLastQueueType )
+        // How many queue items of this QueueType (see the module's
+        // gpu_queue_types) the stream has delivered so far.
+        .def( "get_queue_type_count", &Worker::GetQueueTypeCount )
+        // Live memory cap in bytes (<=0 unlimited) and this worker's tracked
+        // allocation growth since it connected.
+        .def( "get_memory_limit", &Worker::GetMemoryLimit )
+        .def( "get_memory_growth", &Worker::GetMemoryGrowth )
         // Raw Failure byte (Worker::Failure, TracyWorker.hpp): 0=None,
         // ZoneStack, ZoneDoubleEnd, ZoneText, ZoneValue, ZoneColor, ZoneName,
         // MemFree, MemAllocTwice, FrameEnd, FrameImageIndex, FrameImageTwice,
@@ -1134,6 +1146,33 @@ PYBIND11_MODULE( TracyServerBindings, m )
     // -------------------------------------------------------------------------
     // FileRead
     // -------------------------------------------------------------------------
+    // Process-wide bytes currently tracked by the server allocator (all
+    // loaded captures and live workers combined).
+    m.attr( "no_queue_type" ) = (int)Worker::NoQueueType;
+    m.attr( "gpu_queue_types" ) = py::dict(
+        "gpu_new_context"_a = (int)QueueType::GpuNewContext,
+        "gpu_context_name"_a = (int)QueueType::GpuContextName,
+        "gpu_zone_begin"_a = (int)QueueType::GpuZoneBegin,
+        "gpu_zone_begin_callstack"_a = (int)QueueType::GpuZoneBeginCallstack,
+        "gpu_zone_begin_alloc_srcloc"_a = (int)QueueType::GpuZoneBeginAllocSrcLoc,
+        "gpu_zone_begin_alloc_srcloc_callstack"_a = (int)QueueType::GpuZoneBeginAllocSrcLocCallstack,
+        "gpu_zone_end"_a = (int)QueueType::GpuZoneEnd,
+        "gpu_zone_begin_serial"_a = (int)QueueType::GpuZoneBeginSerial,
+        "gpu_zone_begin_callstack_serial"_a = (int)QueueType::GpuZoneBeginCallstackSerial,
+        "gpu_zone_begin_alloc_srcloc_serial"_a = (int)QueueType::GpuZoneBeginAllocSrcLocSerial,
+        "gpu_zone_begin_alloc_srcloc_callstack_serial"_a = (int)QueueType::GpuZoneBeginAllocSrcLocCallstackSerial,
+        "gpu_zone_end_serial"_a = (int)QueueType::GpuZoneEndSerial,
+        "gpu_time"_a = (int)QueueType::GpuTime,
+        "gpu_calibration"_a = (int)QueueType::GpuCalibration,
+        "gpu_time_sync"_a = (int)QueueType::GpuTimeSync );
+    m.attr( "close_reasons" ) = py::dict(
+        "local_shutdown"_a = (int)Worker::CloseReason::LocalShutdown,
+        "memory_limit"_a = (int)Worker::CloseReason::MemoryLimit,
+        "socket_closed"_a = (int)Worker::CloseReason::SocketClosed,
+        "stream_failure"_a = (int)Worker::CloseReason::StreamFailure,
+        "target_terminate"_a = (int)Worker::CloseReason::TargetTerminate );
+    m.def( "tracked_memory", []() -> int64_t { return memUsage.load( std::memory_order_relaxed ); } );
+
     m.def( "open_file", []( const char* path ) -> std::shared_ptr<FileRead> {
         auto f = FileRead::Open( path );
         if( !f ) throw std::runtime_error( "Could not open file" );

@@ -2656,6 +2656,12 @@ const unordered_flat_map<CallstackFrameId, uint32_t, Worker::CallstackFrameIdHas
 }
 #endif
 
+void Worker::SetCloseReason( CloseReason reason )
+{
+    CloseReason expected = CloseReason::None;
+    m_closeReason.compare_exchange_strong( expected, reason, std::memory_order_relaxed );
+}
+
 void Worker::Network()
 {
     auto ShouldExit = [this] { return m_shutdown.load( std::memory_order_relaxed ); };
@@ -2666,14 +2672,14 @@ void Worker::Network()
         {
             std::unique_lock<std::mutex> lock( m_netWriteLock );
             m_netWriteCv.wait( lock, [this] { return m_netWriteCnt > 0 || m_shutdown.load( std::memory_order_relaxed ); } );
-            if( m_shutdown.load( std::memory_order_relaxed ) ) goto close;
+            if( m_shutdown.load( std::memory_order_relaxed ) ) { SetCloseReason( CloseReason::LocalShutdown ); goto close; }
             m_netWriteCnt--;
         }
 
         auto buf = m_buffer + m_bufferOffset;
         lz4sz_t lz4sz;
-        if( !m_sock.Read( &lz4sz, sizeof( lz4sz ), 10, ShouldExit ) ) goto close;
-        if( !m_sock.Read( lz4buf.get(), lz4sz, 10, ShouldExit ) ) goto close;
+        if( !m_sock.Read( &lz4sz, sizeof( lz4sz ), 10, ShouldExit ) ) { if( ShouldExit() ) SetCloseReason( CloseReason::LocalShutdown ); goto close; }
+        if( !m_sock.Read( lz4buf.get(), lz4sz, 10, ShouldExit ) ) { if( ShouldExit() ) SetCloseReason( CloseReason::LocalShutdown ); goto close; }
         auto bb = m_bytes.load( std::memory_order_relaxed );
         m_bytes.store( bb + sizeof( lz4sz ) + lz4sz, std::memory_order_relaxed );
 
@@ -2710,6 +2716,9 @@ void Worker::Exec()
     }
 
     std::chrono::time_point<std::chrono::high_resolution_clock> t0;
+
+    // memUsage spans every worker in the process; the cap applies to this one's own growth.
+    MemScope memScope( m_memGrowth );
 
     m_sock.Send( HandshakeShibboleth, HandshakeShibbolethSize );
     uint32_t protocolVersion = ProtocolVersion;
@@ -2811,8 +2820,9 @@ void Worker::Exec()
 
     for(;;)
     {
-        if( m_shutdown.load( std::memory_order_relaxed ) || ( m_memoryLimit > 0 && memUsage.load( std::memory_order_relaxed ) > m_memoryLimit ) )
+        if( m_shutdown.load( std::memory_order_relaxed ) || ( m_memoryLimit > 0 && m_memGrowth.load( std::memory_order_relaxed ) > m_memoryLimit ) )
         {
+            SetCloseReason( m_shutdown.load( std::memory_order_relaxed ) ? CloseReason::LocalShutdown : CloseReason::MemoryLimit );
             QueryTerminate();
             goto close;
         }
@@ -2824,7 +2834,11 @@ void Worker::Exec()
             netbuf = m_netRead.front();
             m_netRead.erase( m_netRead.begin() );
         }
-        if( netbuf.bufferOffset < 0 ) goto close;
+        if( netbuf.bufferOffset < 0 )
+        {
+            SetCloseReason( m_terminate ? CloseReason::TargetTerminate : CloseReason::SocketClosed );
+            goto close;
+        }
 
         const char* ptr = m_buffer + netbuf.bufferOffset;
         const char* end = ptr + netbuf.size;
@@ -2845,6 +2859,7 @@ void Worker::Exec()
                 if( !DispatchProcess( *ev, ptr ) )
                 {
                     if( m_failure != Failure::None ) HandleFailure( ptr, end );
+                    SetCloseReason( CloseReason::StreamFailure );
                     QueryTerminate();
                     goto close;
                 }
@@ -2919,6 +2934,7 @@ void Worker::Exec()
                 }
                 if( !done ) continue;
             }
+            SetCloseReason( CloseReason::TargetTerminate );
             QueryTerminate();
             UpdateMbps( 0 );
             break;
@@ -3228,6 +3244,9 @@ void Worker::QueryCallstackFrame( uint64_t addr )
 
 bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
 {
+    m_lastQueueType.store( (uint8_t)ev.hdr.type, std::memory_order_relaxed );
+    auto& typeCount = m_queueTypeCounts.count[(uint8_t)ev.hdr.type];
+    typeCount.store( typeCount.load( std::memory_order_relaxed ) + 1, std::memory_order_relaxed );
     if( ev.hdr.idx >= (int)QueueType::StringData )
     {
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
