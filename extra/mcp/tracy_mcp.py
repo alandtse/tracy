@@ -15,6 +15,7 @@ import re
 import socket
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -428,6 +429,16 @@ class TracyInstance:
         # Tracked memory this instance added when loaded; live instances
         # report their own growth instead.
         self.memory_mb = 0
+        self._eval_lock = threading.Lock()
+        self.active_evals = 0
+
+    def begin_eval(self) -> None:
+        with self._eval_lock:
+            self.active_evals += 1
+
+    def end_eval(self) -> None:
+        with self._eval_lock:
+            self.active_evals -= 1
 
     def touch(self) -> None:
         self.last_used = time.time()
@@ -437,8 +448,11 @@ class TracyInstance:
 
         A live instance still connected is actively recording — never evict it
         automatically. Everything else (file captures, disconnected live
-        instances) is fair game for the LRU cap.
+        instances) is fair game for the LRU cap. An instance with an eval
+        in flight is never evictable.
         """
+        if self.active_evals > 0:
+            return False
         if self.worker is not None and self.path is None:
             try:
                 return not self.worker.is_connected()
@@ -465,6 +479,8 @@ def _evict_idle() -> list[str]:
     now = time.time()
     evicted = []
     for name, inst in list(instances.items()):
+        if inst.active_evals > 0:
+            continue
         if inst.path is not None:
             if now - inst.last_used >= _FILE_IDLE_TTL_S:
                 del instances[name]
@@ -1106,13 +1122,20 @@ async def unload_capture(instance_id: str) -> str:
     Automatic eviction exists as a backstop (see `list_instances`), not a
     substitute for unloading what you no longer need.
     """
-    if instance_id in instances:
-        inst = instances.pop(instance_id)
-        _shutdown_worker(inst.worker)
-        del inst
-        gc.collect()
-        return f"Instance '{instance_id}' unloaded."
-    return f"Instance '{instance_id}' not found."
+    inst = instances.get(instance_id)
+    if inst is None:
+        return f"Instance '{instance_id}' not found."
+    if inst.active_evals > 0:
+        return (
+            f"Instance '{instance_id}' has {inst.active_evals} eval(s) still running, so it was "
+            f"not unloaded. Wait for them to finish (poll async evals with the `task` tool), "
+            f"then unload."
+        )
+    del instances[instance_id]
+    _shutdown_worker(inst.worker)
+    del inst
+    gc.collect()
+    return f"Instance '{instance_id}' unloaded."
 
 
 @mcp_server.tool(name="eval")
@@ -1135,29 +1158,35 @@ async def tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> o
     instance.touch()
 
     if not async_mode:
-        return await _execute_eval(code, instance.worker)
+        instance.begin_eval()
+        try:
+            return await _execute_eval(code, instance.worker)
+        finally:
+            instance.end_eval()
 
     # Async mode: spawn task and return immediately
     task_id = str(uuid.uuid4())
     task = Task(task_id, code)
     tasks[task_id] = task
+    instance.begin_eval()
     asyncio.get_running_loop().run_in_executor(
-        executor, _run_task_sync, task, instance.worker
+        executor, _run_task_sync, task, instance
     )
     return {"task_id": task_id, "status": "running"}
 
 
-def _run_task_sync(task: Task, worker: object) -> None:
+def _run_task_sync(task: Task, instance: TracyInstance) -> None:
     """Run a background eval task in the thread pool."""
     task.status = "running"
     try:
-        task.result = _execute_eval_sync(task.code, worker)
+        task.result = _execute_eval_sync(task.code, instance.worker)
         task.status = "completed"
     except Exception as e:
         task.error = str(e)
         task.status = "failed"
     finally:
         task.end_time = time.time()
+        instance.end_eval()
 
 
 def _execute_eval_sync(code: str, ctx: object) -> str:
