@@ -3245,6 +3245,8 @@ void Worker::QueryCallstackFrame( uint64_t addr )
 bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
 {
     m_lastQueueType.store( (uint8_t)ev.hdr.type, std::memory_order_relaxed );
+    auto& typeCount = m_queueTypeCounts.count[(uint8_t)ev.hdr.type];
+    typeCount.store( typeCount.load( std::memory_order_relaxed ) + 1, std::memory_order_relaxed );
     if( ev.hdr.idx >= (int)QueueType::StringData )
     {
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
