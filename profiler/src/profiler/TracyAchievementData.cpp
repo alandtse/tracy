@@ -4,6 +4,7 @@
 #include "data/Text100Million.hpp"
 #include "data/TextAnnotateZones.hpp"
 #include "data/TextAppInfo.hpp"
+#include "data/TextCompareTraces.hpp"
 #include "data/TextConnectToClient.hpp"
 #include "data/TextContention.hpp"
 #include "data/TextFindZone.hpp"
@@ -17,11 +18,14 @@
 #include "data/TextInstrumentationStatistics.hpp"
 #include "data/TextIntro.hpp"
 #include "data/TextLeaks.hpp"
+#include "data/TextLightFlame.hpp"
 #include "data/TextLoadTrace.hpp"
 #include "data/TextLocks.hpp"
 #include "data/TextManual.hpp"
 #include "data/TextMemory.hpp"
 #include "data/TextPlots.hpp"
+#include "data/TextReadAssembly.hpp"
+#include "data/TextReadSource.hpp"
 #include "data/TextSamplingIntro.hpp"
 #include "data/TextSections.hpp"
 #include "data/TextSaveTrace.hpp"
@@ -122,7 +126,34 @@ AchievementItem ai_findZone = {
     .text = Unpack( TextFindZone )
 };
 
-AchievementItem* ac_inspectZoneItems[] = { &ai_findZone, nullptr };
+AchievementItem ai_readAssembly = {
+    .id = "readAssembly",
+    .name = "Assembly required",
+    .text = Unpack( TextReadAssembly )
+};
+
+AchievementItem ai_compareTraces = {
+    .id = "compareTraces",
+    .name = "Compare traces",
+    .text = Unpack( TextCompareTraces )
+};
+
+AchievementItem* ac_readSourceItems[] = { &ai_readAssembly, &ai_compareTraces, nullptr };
+
+AchievementItem ai_readSource = {
+    .id = "readSource",
+    .name = "Read the source",
+    .text = Unpack( TextReadSource ),
+    .items = ac_readSourceItems
+};
+
+AchievementItem ai_lightFlame = {
+    .id = "lightFlame",
+    .name = "Light the flame",
+    .text = Unpack( TextLightFlame )
+};
+
+AchievementItem* ac_inspectZoneItems[] = { &ai_findZone, &ai_readSource, &ai_lightFlame, nullptr };
 
 AchievementItem ai_inspectZone = {
     .id = "inspectZone",
