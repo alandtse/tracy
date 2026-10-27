@@ -677,6 +677,29 @@ def _disconnect_reason(inst) -> str | None:
         return None
 
 
+def _stream_info(inst) -> dict:
+    """Size and growth of a live stream; empty for file captures.
+
+    `seconds_to_cap` is only given while connected and capped.
+    """
+    if inst.path is not None or not inst.worker:
+        return {}
+    w = inst.worker
+    try:
+        data_s = max((w.get_last_time() - w.get_first_time()) / 1e9, 0.0)
+        growth_mb = w.get_memory_growth() / _MB
+        info = {"data_seconds": round(data_s, 1)}
+        if data_s > 0:
+            rate = growth_mb / data_s
+            info["stream_mb_per_s"] = round(rate, 1)
+            cap_mb = w.get_memory_limit() / _MB
+            if rate > 0 and cap_mb > 0 and w.is_connected():
+                info["seconds_to_cap"] = max(round((cap_mb - growth_mb) / rate, 1), 0.0)
+        return info
+    except Exception:
+        return {}
+
+
 @mcp_server.tool()
 async def list_instances() -> list[dict]:
     """List all loaded Tracy instances and captures with metadata.
@@ -691,6 +714,12 @@ async def list_instances() -> list[dict]:
     `TRACY_MCP_DISCONNECTED_TTL_S`, or after a file-loaded capture sits idle
     past `TRACY_MCP_FILE_IDLE_TTL_S` — it's already durably on disk, so
     nothing is lost; just `load_capture` it again.
+
+    For a live instance, `data_seconds` is how much stream time it holds,
+    `stream_mb_per_s` is its memory growth per second of that, and
+    `seconds_to_cap` is the time left before the memory cap closes the
+    stream at that rate (only while connected). Use these to size a
+    capture window before the cap cuts it short.
 
     `background_done: false` means a just-loaded capture is still building
     zone/symbol statistics on a background thread — `get_all_zone_stats`
@@ -709,6 +738,7 @@ async def list_instances() -> list[dict]:
             "disconnect_reason": _disconnect_reason(inst),
             "background_done": inst.worker.is_background_done() if inst.worker else None,
             "idle_seconds": now - inst.last_used,
+            **_stream_info(inst),
         }
         for name, inst in instances.items()
     ]
@@ -1041,7 +1071,10 @@ async def save_trace(
                     Returns {task_id, status: "running"}; poll with `task`.
 
     On success returns a dict with path, uncompressed_bytes, compressed_bytes,
-    ratio, and elapsed_ms — the same numbers the capture tool prints.
+    ratio, and elapsed_ms — the same numbers the capture tool prints. For a
+    live instance it also has `connected`, `disconnect_reason` (when the
+    stream already ended, e.g. at the memory cap) and the `list_instances`
+    stream fields, so a cut-short capture is visible in the result.
     """
     if instance_id not in instances:
         return f"Error: Instance '{instance_id}' not found. Use list_instances to find valid IDs."
@@ -1067,19 +1100,30 @@ async def save_trace(
             f"or choose a different path."
         )
 
+    extra = _save_extra(instance)
     if not async_mode:
-        return await _execute_save(instance.worker, path, level, streams, fi_dict)
+        return await _execute_save(instance.worker, path, level, streams, fi_dict, extra)
 
     task_id = str(uuid.uuid4())
     t = Task(task_id, f"save_trace({instance_id} -> {path})")
     tasks[task_id] = t
     asyncio.get_running_loop().run_in_executor(
-        executor, _run_save_task_sync, t, instance.worker, path, level, streams, fi_dict
+        executor, _run_save_task_sync, t, instance.worker, path, level, streams, fi_dict, extra
     )
     return {"task_id": task_id, "status": "running"}
 
 
-def _save_worker_sync(worker: object, path: str, level: int, streams: int, fi_dict: bool) -> dict:
+def _save_extra(inst) -> dict:
+    if inst.path is not None:
+        return {}
+    extra = {"connected": inst.worker.is_connected()}
+    reason = _disconnect_reason(inst)
+    if reason:
+        extra["disconnect_reason"] = reason
+    return {**extra, **_stream_info(inst)}
+
+
+def _save_worker_sync(worker: object, path: str, level: int, streams: int, fi_dict: bool, extra: dict | None = None) -> dict:
     t0 = time.time()
     uncompressed, compressed = tracy_server.save_worker(
         worker, path, level, streams, fi_dict
@@ -1092,13 +1136,14 @@ def _save_worker_sync(worker: object, path: str, level: int, streams: int, fi_di
         "compressed_bytes": compressed,
         "ratio": ratio,
         "elapsed_ms": elapsed_ms,
+        **(extra or {}),
     }
 
 
-def _run_save_task_sync(t: Task, worker: object, path: str, level: int, streams: int, fi_dict: bool) -> None:
+def _run_save_task_sync(t: Task, worker: object, path: str, level: int, streams: int, fi_dict: bool, extra: dict | None = None) -> None:
     t.status = "running"
     try:
-        t.result = _save_worker_sync(worker, path, level, streams, fi_dict)
+        t.result = _save_worker_sync(worker, path, level, streams, fi_dict, extra)
         t.status = "completed"
     except Exception as e:
         t.error = str(e)
@@ -1107,9 +1152,9 @@ def _run_save_task_sync(t: Task, worker: object, path: str, level: int, streams:
         t.end_time = time.time()
 
 
-async def _execute_save(worker: object, path: str, level: int, streams: int, fi_dict: bool) -> dict:
+async def _execute_save(worker: object, path: str, level: int, streams: int, fi_dict: bool, extra: dict | None = None) -> dict:
     return await asyncio.get_running_loop().run_in_executor(
-        executor, _save_worker_sync, worker, path, level, streams, fi_dict
+        executor, _save_worker_sync, worker, path, level, streams, fi_dict, extra
     )
 
 
@@ -1133,11 +1178,13 @@ async def unload_capture(instance_id: str) -> str:
             f"not unloaded. Wait for them to finish (poll async evals with the `task` tool), "
             f"then unload."
         )
+    reason = _disconnect_reason(inst)
     del instances[instance_id]
     _shutdown_worker(inst.worker)
     del inst
     gc.collect()
-    return f"Instance '{instance_id}' unloaded."
+    suffix = f" Its stream had ended: {reason}." if reason else ""
+    return f"Instance '{instance_id}' unloaded.{suffix}"
 
 
 @mcp_server.tool(name="eval")
