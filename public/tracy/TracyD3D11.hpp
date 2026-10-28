@@ -222,6 +222,7 @@ public:
         if (disjoint.Disjoint == TRUE)
         {
             m_previousCheckpoint = m_nextCheckpoint;
+            m_immediateDevCtx->Begin(m_disjointQuery);
             TracyD3D11Panic("disjoint timestamps detected; dropping.");
             return;
         }
@@ -229,6 +230,7 @@ public:
         if (disjoint.Frequency == 0)
         {
             m_previousCheckpoint = m_nextCheckpoint;
+            m_immediateDevCtx->Begin(m_disjointQuery);
             TracyD3D11Panic("zero GPU timestamp frequency; dropping.");
             return;
         }
