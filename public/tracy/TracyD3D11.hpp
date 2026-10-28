@@ -186,8 +186,11 @@ public:
             if( m_previousCheckpoint != m_nextCheckpoint )
             {
                 D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = { };
-                if( m_immediateDevCtx->GetData( m_disjointQuery, &disjoint, sizeof( disjoint ), D3D11_ASYNC_GETDATA_DONOTFLUSH ) != S_OK ) return;
-                m_immediateDevCtx->Begin( m_disjointQuery );
+                const UINT flags = mode == CollectMode::BLOCK ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH;
+                HRESULT hr;
+                while( ( hr = m_immediateDevCtx->GetData( m_disjointQuery, &disjoint, sizeof( disjoint ), flags ) ) == S_FALSE && mode == CollectMode::BLOCK ) YieldThread();
+                if( hr == S_FALSE ) return;
+                if( hr == S_OK ) m_immediateDevCtx->Begin( m_disjointQuery );
             }
             m_previousCheckpoint = m_nextCheckpoint = m_queryCounter;
             return;
